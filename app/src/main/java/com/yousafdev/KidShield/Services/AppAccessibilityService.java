@@ -26,6 +26,9 @@ public class AppAccessibilityService extends AccessibilityService {
 
                 Intent intent = new Intent(ACTION_FOREGROUND_APP);
                 intent.putExtra(EXTRA_PACKAGE_NAME, packageName);
+                // Restrict delivery to this app so the foreground-app signal cannot be
+                // read or spoofed by other apps.
+                intent.setPackage(getPackageName());
                 sendBroadcast(intent);
             }
         }

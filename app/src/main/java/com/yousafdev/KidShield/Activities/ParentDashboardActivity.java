@@ -3,10 +3,12 @@ package com.yousafdev.KidShield.Activities;
 import android.content.Intent;
 import android.os.Bundle;
 import android.view.View;
+import android.widget.Button;
 import android.widget.ProgressBar;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
@@ -22,6 +24,7 @@ import com.google.firebase.database.ValueEventListener;
 import com.yousafdev.KidShield.Adapters.ChildAdapter;
 import com.yousafdev.KidShield.Models.Child;
 import com.yousafdev.KidShield.R;
+import com.yousafdev.KidShield.Utils.SessionManager;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -53,12 +56,28 @@ public class ParentDashboardActivity extends AppCompatActivity implements ChildA
         recyclerView.setLayoutManager(new LinearLayoutManager(this));
         recyclerView.setAdapter(adapter);
 
+        Button logoutButton = findViewById(R.id.button_parent_logout);
+        logoutButton.setOnClickListener(v -> confirmLogout());
+
         fetchChildren();
+    }
+
+    private void confirmLogout() {
+        new AlertDialog.Builder(this)
+                .setTitle("Log out?")
+                .setPositiveButton("Log Out", (dialog, which) -> SessionManager.logout(this, false))
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     private void fetchChildren() {
         progressBar.setVisibility(View.VISIBLE);
-        if (currentUser == null) return;
+        if (currentUser == null) {
+            progressBar.setVisibility(View.GONE);
+            Toast.makeText(this, "Session expired. Please log in again.", Toast.LENGTH_SHORT).show();
+            SessionManager.logout(this, false);
+            return;
+        }
 
         Query query = databaseReference.orderByChild("parentEmail").equalTo(currentUser.getEmail());
 
@@ -87,6 +106,9 @@ public class ParentDashboardActivity extends AppCompatActivity implements ChildA
 
     @Override
     public void onChildClick(int position) {
+        if (position < 0 || position >= childList.size()) {
+            return;
+        }
         Child selectedChild = childList.get(position);
         Intent intent = new Intent(this, ChildDetailActivity.class);
         intent.putExtra("CHILD_UID", selectedChild.getUid());

@@ -6,7 +6,9 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.app.admin.DevicePolicyManager;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -14,9 +16,10 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.database.Cursor;
+import android.location.Location;
 import android.os.Build;
-import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.provider.CallLog;
 import android.provider.Telephony;
 import android.util.Log;
@@ -25,9 +28,14 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.core.app.ActivityCompat;
 import androidx.core.app.NotificationCompat;
+import androidx.core.content.ContextCompat;
 
 import com.google.android.gms.location.FusedLocationProviderClient;
+import com.google.android.gms.location.LocationCallback;
+import com.google.android.gms.location.LocationRequest;
+import com.google.android.gms.location.LocationResult;
 import com.google.android.gms.location.LocationServices;
+import com.google.android.gms.location.Priority;
 import com.google.firebase.auth.FirebaseAuth;
 import com.google.firebase.auth.FirebaseUser;
 import com.google.firebase.database.DataSnapshot;
@@ -37,6 +45,7 @@ import com.google.firebase.database.FirebaseDatabase;
 import com.google.firebase.database.ValueEventListener;
 import com.yousafdev.KidShield.Activities.BlockedScreenActivity;
 import com.yousafdev.KidShield.R;
+import com.yousafdev.KidShield.Utils.MyDeviceAdminReceiver;
 
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -53,11 +62,25 @@ public class MonitoringService extends Service {
 
     public static final String ACTION_SYNC_DATA = "com.yousafdev.KidShield.ACTION_SYNC_DATA";
 
+    // How often continuous location updates are requested (ms).
+    private static final long LOCATION_UPDATE_INTERVAL_MS = 60_000L;
+    private static final long LOCATION_FASTEST_INTERVAL_MS = 30_000L;
+
     private FusedLocationProviderClient fusedLocationClient;
+    private LocationCallback locationCallback;
+
     private DatabaseReference databaseReference;
     private FirebaseUser currentUser;
 
-    private HashSet<String> blockedApps = new HashSet<>();
+    private DevicePolicyManager devicePolicyManager;
+    private ComponentName deviceAdminComponent;
+
+    private DatabaseReference blockedAppsRef;
+    private ValueEventListener blockedAppsListener;
+    private DatabaseReference lockCommandRef;
+    private ValueEventListener lockCommandListener;
+
+    private final HashSet<String> blockedApps = new HashSet<>();
     private String lastForegroundApp = "";
     private AppEventReceiver appEventReceiver;
 
@@ -75,14 +98,20 @@ public class MonitoringService extends Service {
             return;
         }
 
+        devicePolicyManager = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+        deviceAdminComponent = new ComponentName(this, MyDeviceAdminReceiver.class);
+
         databaseReference = FirebaseDatabase.getInstance().getReference("users")
                 .child(currentUser.getUid());
 
         listenForBlockedApps();
+        listenForLockCommand();
+        startLocationUpdates();
 
         appEventReceiver = new AppEventReceiver();
         IntentFilter filter = new IntentFilter(AppAccessibilityService.ACTION_FOREGROUND_APP);
-        registerReceiver(appEventReceiver, filter, RECEIVER_EXPORTED);
+        // Internal, same-app broadcast only — must NOT be exported or other apps could spoof it.
+        ContextCompat.registerReceiver(this, appEventReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED);
     }
 
     @Override
@@ -99,11 +128,13 @@ public class MonitoringService extends Service {
                 .setCategory(NotificationCompat.CATEGORY_SERVICE)
                 .build();
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION | ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-        } else {
-            startForeground(NOTIFICATION_ID, notification);
+        startForegroundSafely(notification);
+
+        // If we could not initialise (e.g. started while logged out), stop cleanly instead of crashing.
+        if (databaseReference == null) {
+            Log.w(TAG, "No database reference (user not logged in). Stopping service.");
+            stopSelf();
+            return START_NOT_STICKY;
         }
 
         if (intent != null && ACTION_SYNC_DATA.equals(intent.getAction())) {
@@ -112,6 +143,21 @@ public class MonitoringService extends Service {
         }
 
         return START_STICKY;
+    }
+
+    private void startForegroundSafely(Notification notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // On Android 14+ the location FGS type requires location permission to be granted at
+            // start time; if it isn't, fall back to data-sync only so app-blocking keeps working
+            // instead of the whole service crashing.
+            int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+            if (hasLocationPermission()) {
+                type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION;
+            }
+            startForeground(NOTIFICATION_ID, notification, type);
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
     }
 
     private void performDataSync() {
@@ -123,13 +169,14 @@ public class MonitoringService extends Service {
     }
 
     private void listenForBlockedApps() {
-        databaseReference.child("blocked_apps").addValueEventListener(new ValueEventListener() {
+        blockedAppsRef = databaseReference.child("blocked_apps");
+        blockedAppsListener = new ValueEventListener() {
             @Override
             public void onDataChange(@NonNull DataSnapshot dataSnapshot) {
                 blockedApps.clear();
                 for (DataSnapshot snapshot : dataSnapshot.getChildren()) {
                     if (Boolean.TRUE.equals(snapshot.getValue(Boolean.class))) {
-                        blockedApps.add(snapshot.getKey().replace("_", "."));
+                        blockedApps.add(decodePackageKey(snapshot.getKey()));
                     }
                 }
                 Log.d(TAG, "Blocked apps list updated: " + blockedApps.toString());
@@ -139,18 +186,102 @@ public class MonitoringService extends Service {
             public void onCancelled(@NonNull DatabaseError databaseError) {
                 Log.e(TAG, "Failed to listen for blocked apps", databaseError.toException());
             }
-        });
+        };
+        blockedAppsRef.addValueEventListener(blockedAppsListener);
+    }
+
+    /**
+     * Listens for a remote lock command written by the parent at users/{uid}/commands/lock.
+     * When present, the child device is locked via device admin and the command is consumed.
+     */
+    private void listenForLockCommand() {
+        lockCommandRef = databaseReference.child("commands").child("lock");
+        lockCommandListener = new ValueEventListener() {
+            @Override
+            public void onDataChange(@NonNull DataSnapshot snapshot) {
+                if (!snapshot.exists()) {
+                    return;
+                }
+                Log.d(TAG, "Remote lock command received.");
+                if (devicePolicyManager != null && devicePolicyManager.isAdminActive(deviceAdminComponent)) {
+                    try {
+                        devicePolicyManager.lockNow();
+                        Log.d(TAG, "Device locked via remote command.");
+                    } catch (SecurityException e) {
+                        Log.e(TAG, "lockNow() failed — device admin not authorised.", e);
+                    }
+                } else {
+                    Log.w(TAG, "Remote lock requested but device admin is not active.");
+                }
+                // Consume the command so it is not re-executed.
+                snapshot.getRef().removeValue();
+            }
+
+            @Override
+            public void onCancelled(@NonNull DatabaseError error) {
+                Log.e(TAG, "Failed to listen for lock command", error.toException());
+            }
+        };
+        lockCommandRef.addValueEventListener(lockCommandListener);
+    }
+
+    @SuppressLint("MissingPermission")
+    private void startLocationUpdates() {
+        if (!hasLocationPermission()) {
+            Log.w(TAG, "Location permission not granted; skipping continuous updates.");
+            return;
+        }
+        LocationRequest request = new LocationRequest.Builder(
+                Priority.PRIORITY_BALANCED_POWER_ACCURACY, LOCATION_UPDATE_INTERVAL_MS)
+                .setMinUpdateIntervalMillis(LOCATION_FASTEST_INTERVAL_MS)
+                .build();
+
+        locationCallback = new LocationCallback() {
+            @Override
+            public void onLocationResult(@NonNull LocationResult result) {
+                Location location = result.getLastLocation();
+                if (location != null) {
+                    uploadLocation(location);
+                }
+            }
+        };
+        fusedLocationClient.requestLocationUpdates(request, locationCallback, Looper.getMainLooper());
+        Log.d(TAG, "Started continuous location updates.");
+    }
+
+    private void uploadLocation(@NonNull Location location) {
+        if (databaseReference == null) {
+            return;
+        }
+        HashMap<String, Object> locationData = new HashMap<>();
+        locationData.put("latitude", location.getLatitude());
+        locationData.put("longitude", location.getLongitude());
+        locationData.put("timestamp", System.currentTimeMillis());
+        databaseReference.child("data/location").setValue(locationData);
+        Log.d(TAG, "Location uploaded: " + location.getLatitude() + ", " + location.getLongitude());
     }
 
     private void checkForegroundApp(String currentApp) {
         if (!currentApp.equals(lastForegroundApp) && blockedApps.contains(currentApp)) {
             Log.d(TAG, "Blocked app detected in foreground: " + currentApp);
+            logBlockedAttempt(currentApp);
 
             Intent intent = new Intent(getApplicationContext(), BlockedScreenActivity.class);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
             startActivity(intent);
         }
         lastForegroundApp = currentApp;
+    }
+
+    /** Records a blocked-app open attempt so the parent can be notified. */
+    private void logBlockedAttempt(String packageName) {
+        if (databaseReference == null) {
+            return;
+        }
+        HashMap<String, Object> event = new HashMap<>();
+        event.put("packageName", packageName);
+        event.put("timestamp", System.currentTimeMillis());
+        databaseReference.child("data/blocked_events").push().setValue(event);
     }
 
     private void fetchAndUploadInstalledApps() {
@@ -161,7 +292,7 @@ public class MonitoringService extends Service {
 
         for (ApplicationInfo app : apps) {
             if (pm.getLaunchIntentForPackage(app.packageName) != null) {
-                if(app.packageName.equals(getPackageName())) {
+                if (app.packageName.equals(getPackageName())) {
                     continue;
                 }
 
@@ -172,27 +303,21 @@ public class MonitoringService extends Service {
                 appData.put("appName", appName);
                 appData.put("packageName", packageName);
 
-                appsRef.child(packageName.replace(".", "_")).setValue(appData);
+                appsRef.child(encodePackageKey(packageName)).setValue(appData);
             }
         }
     }
 
-
     @SuppressLint("MissingPermission")
     private void fetchAndUploadLocation() {
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+        if (!hasLocationPermission()) {
             Log.w(TAG, "Location permission not granted.");
             return;
         }
         fusedLocationClient.getLastLocation()
                 .addOnSuccessListener(location -> {
                     if (location != null) {
-                        HashMap<String, Object> locationData = new HashMap<>();
-                        locationData.put("latitude", location.getLatitude());
-                        locationData.put("longitude", location.getLongitude());
-                        locationData.put("timestamp", System.currentTimeMillis());
-                        databaseReference.child("data/location").setValue(locationData);
-                        Log.d(TAG, "Location uploaded: " + location.getLatitude() + ", " + location.getLongitude());
+                        uploadLocation(location);
                     } else {
                         Log.w(TAG, "Failed to get location.");
                     }
@@ -260,6 +385,23 @@ public class MonitoringService extends Service {
         }
     }
 
+    private boolean hasLocationPermission() {
+        return ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                || ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /**
+     * Firebase keys cannot contain '.', so package names are stored with dots escaped.
+     * A URL-safe token ('~d~') is used instead of '_' because package names may legally
+     * contain underscores, and a plain '.'<->'_' swap would corrupt them.
+     */
+    private static String encodePackageKey(String packageName) {
+        return packageName.replace(".", "~d~");
+    }
+
+    private static String decodePackageKey(String key) {
+        return key.replace("~d~", ".");
+    }
 
     private String getCallType(int type) {
         switch (type) {
@@ -284,12 +426,27 @@ public class MonitoringService extends Service {
         }
     }
 
-
     @Override
     public void onDestroy() {
         super.onDestroy();
         Log.d(TAG, "Service Destroyed");
-        unregisterReceiver(appEventReceiver);
+
+        if (appEventReceiver != null) {
+            try {
+                unregisterReceiver(appEventReceiver);
+            } catch (IllegalArgumentException e) {
+                Log.w(TAG, "Receiver was not registered.", e);
+            }
+        }
+        if (blockedAppsRef != null && blockedAppsListener != null) {
+            blockedAppsRef.removeEventListener(blockedAppsListener);
+        }
+        if (lockCommandRef != null && lockCommandListener != null) {
+            lockCommandRef.removeEventListener(lockCommandListener);
+        }
+        if (fusedLocationClient != null && locationCallback != null) {
+            fusedLocationClient.removeLocationUpdates(locationCallback);
+        }
     }
 
     private void createNotificationChannel() {

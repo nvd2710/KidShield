@@ -96,7 +96,7 @@ public class AppBlockerActivity extends AppCompatActivity implements AppBlockerA
             public void onDataChange(@NonNull DataSnapshot snapshot) {
                 blockedStatusMap.clear();
                 for (DataSnapshot statusSnapshot : snapshot.getChildren()) {
-                    blockedStatusMap.put(statusSnapshot.getKey().replace("_", "."), statusSnapshot.getValue(Boolean.class));
+                    blockedStatusMap.put(decodePackageKey(statusSnapshot.getKey()), statusSnapshot.getValue(Boolean.class));
                 }
                 loadInstalledApps();
             }
@@ -133,7 +133,7 @@ public class AppBlockerActivity extends AppCompatActivity implements AppBlockerA
 
     @Override
     public void onAppBlockChanged(String packageName, boolean isBlocked) {
-        childRef.child("blocked_apps").child(packageName.replace(".", "_")).setValue(isBlocked);
+        childRef.child("blocked_apps").child(encodePackageKey(packageName)).setValue(isBlocked);
         // Update the master list so the state is preserved during search
         for (AppInfo app : fullAppList) {
             if (app.packageName.equals(packageName)) {
@@ -141,5 +141,15 @@ public class AppBlockerActivity extends AppCompatActivity implements AppBlockerA
                 break;
             }
         }
+    }
+
+    // Firebase keys cannot contain '.', and package names may legally contain '_', so a plain
+    // '.'<->'_' swap would corrupt them. Use a distinct token instead. Must match MonitoringService.
+    static String encodePackageKey(String packageName) {
+        return packageName.replace(".", "~d~");
+    }
+
+    static String decodePackageKey(String key) {
+        return key.replace("~d~", ".");
     }
 }

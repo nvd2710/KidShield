@@ -62,4 +62,16 @@ public class BootReceiver extends BroadcastReceiver {
             Log.e(TAG, "AlarmManager is null. Cannot schedule data sync.");
         }
     }
+
+    /** Cancels the periodic data-sync alarm. Used when a child device logs out. */
+    public static void cancelDataSync(Context context) {
+        AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        Intent intent = new Intent(context, AlarmReceiver.class);
+        int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT : PendingIntent.FLAG_UPDATE_CURRENT;
+        PendingIntent pendingIntent = PendingIntent.getBroadcast(context, 0, intent, flags);
+        if (alarmManager != null) {
+            alarmManager.cancel(pendingIntent);
+            Log.d(TAG, "Data sync alarm cancelled.");
+        }
+    }
 }
