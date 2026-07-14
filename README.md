@@ -38,10 +38,6 @@ KidShield is built using a modern hybrid architecture optimized for reliability 
 
 ---
 
-## 📱 Website
-
-**https://KidShield.yousafdev.xyz/**
-
 ## 🖼️ Screenshots
 
 ### Parent Dashboard
@@ -125,12 +121,6 @@ Do NOT modify com.google.android.geo.API_KEY.
 * Connect your Android device
 * Run the project from Android Studio
 * Register as a parent and child to explore all features
-
----
-## 📝 License
-This project is licensed under the MIT License. See LICENSE for details.
-
-Based on [KidShield by Yousaf1204](https://github.com/Yousaf1204/KidShield).
 
 ---
 
