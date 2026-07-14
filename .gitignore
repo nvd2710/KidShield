@@ -16,3 +16,7 @@ local.properties
 
 # Firebase config (contains API keys)
 google-services.json
+
+# Machine-local IDE state (contains device serials / project IDs)
+/.idea/deploymentTargetSelector.xml
+/.idea/appInsightsSettings.xml

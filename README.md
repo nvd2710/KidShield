@@ -69,7 +69,7 @@ KidShield is built using a modern hybrid architecture optimized for reliability 
 ### ✅ Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/Yousaf1204/KidShield.git
+git clone https://github.com/nvd2710/KidShield.git
 cd KidShield
 ```
 
@@ -129,6 +129,8 @@ Do NOT modify com.google.android.geo.API_KEY.
 ---
 ## 📝 License
 This project is licensed under the MIT License. See LICENSE for details.
+
+Based on [KidShield by Yousaf1204](https://github.com/Yousaf1204/KidShield).
 
 ---
 
